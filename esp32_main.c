@@ -1,0 +1,518 @@
+/**
+ * @file    esp32_combined.ino
+ * @brief   Combined camera + audio receiver for Freenove ESP32-S3-WROOM.
+ *
+ * Two modes, both triggered by K64F over UART (RX=42, TX=41):
+ *   "TAKE_PHOTO\n"  → capture JPEG → POST /ocr  → send TRANSCRIPT: back
+ *   Audio frame     → receive int16 framed audio → POST /audio → send TRANSCRIPT: back
+ *
+ * Pin summary:
+ *   Camera  : GPIO 4,5,6,7,8,9,10,11,12,13,15,16,17,18 (locked by camera driver)
+ *   UART RX : GPIO 42  <-- K64F PTC17 (TX)
+ *   UART TX : GPIO 41  --> K64F PTC16 (RX)
+ *   GND     : shared with K64F
+ */
+
+#include "Arduino.h"
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+/* =========================================================================
+ * Camera pin definitions — Freenove ESP32-S3-WROOM
+ * ========================================================================= */
+#define CAMERA_MODEL_ESP32S3_EYE
+
+#define PWDN_GPIO_NUM    -1
+#define RESET_GPIO_NUM   -1
+#define XCLK_GPIO_NUM    15
+#define SIOD_GPIO_NUM     4
+#define SIOC_GPIO_NUM     5
+#define Y9_GPIO_NUM      16
+#define Y8_GPIO_NUM      17
+#define Y7_GPIO_NUM      18
+#define Y6_GPIO_NUM      12
+#define Y5_GPIO_NUM      10
+#define Y4_GPIO_NUM       8
+#define Y3_GPIO_NUM       9
+#define Y2_GPIO_NUM      11
+#define VSYNC_GPIO_NUM    6
+#define HREF_GPIO_NUM     7
+#define PCLK_GPIO_NUM    13
+
+/* =========================================================================
+ * WiFi / Flask config
+ * ========================================================================= */
+const char* WIFI_SSID     = "WIFI_HERE";
+const char* WIFI_PASSWORD = "WIFI_PASS_HERE";
+
+/* Flask endpoints — must match m5.py route names */
+#define FLASK_OCR_URL    "http://10.172.87.69:5000/ocr"
+#define FLASK_AUDIO_URL  "http://10.172.87.69:5000/audio"
+
+/* =========================================================================
+ * UART to K64F
+ *   GPIO42 RX <-- K64F PTC17 (TX)
+ *   GPIO41 TX --> K64F PTC16 (RX)
+ *   NOTE: GPIO17/18 are camera pins — cannot be used for UART
+ * ========================================================================= */
+#define K64F_RX_PIN    42
+#define K64F_TX_PIN    41
+#define K64F_BAUDRATE  1000000    /* must match K64F ESP_UART_BAUDRATE */
+
+/* =========================================================================
+ * Audio frame protocol — must match K64F SendAudioFrame()
+ *   [ 0xAA | 0x55 | COUNT_LO | COUNT_HI | DATA(count x 2 bytes) | CS_LO | CS_HI ]
+ * ========================================================================= */
+#define FRAME_START_0   0xAA
+#define FRAME_START_1   0x55
+#define MAX_SAMPLES     19000     /* must match K64F MAX_SAMPLES */
+
+/* =========================================================================
+ * Audio receiver state machine
+ * ========================================================================= */
+typedef enum {
+    WAIT_START_0,
+    WAIT_START_1,
+    READ_COUNT_0,
+    READ_COUNT_1,
+    READ_DATA,
+    READ_CHECKSUM_0,
+    READ_CHECKSUM_1
+} RxState;
+
+/* Audio receive buffer — int16 samples, accessed as raw bytes */
+static int16_t  rxArray[MAX_SAMPLES];
+static uint8_t *rxBytes    = (uint8_t *)rxArray;
+static RxState  rxState    = WAIT_START_0;
+static uint16_t expectCount = 0;
+static uint32_t byteIndex   = 0;
+static uint8_t  csByte0     = 0;
+
+/* =========================================================================
+ * Camera init
+ * ========================================================================= */
+void Camera_Init(void)
+{
+    camera_config_t config;
+    config.ledc_channel  = LEDC_CHANNEL_0;
+    config.ledc_timer    = LEDC_TIMER_0;
+    config.pin_d0        = Y2_GPIO_NUM;
+    config.pin_d1        = Y3_GPIO_NUM;
+    config.pin_d2        = Y4_GPIO_NUM;
+    config.pin_d3        = Y5_GPIO_NUM;
+    config.pin_d4        = Y6_GPIO_NUM;
+    config.pin_d5        = Y7_GPIO_NUM;
+    config.pin_d6        = Y8_GPIO_NUM;
+    config.pin_d7        = Y9_GPIO_NUM;
+    config.pin_xclk      = XCLK_GPIO_NUM;
+    config.pin_pclk      = PCLK_GPIO_NUM;
+    config.pin_vsync     = VSYNC_GPIO_NUM;
+    config.pin_href      = HREF_GPIO_NUM;
+    config.pin_sccb_sda  = SIOD_GPIO_NUM;
+    config.pin_sccb_scl  = SIOC_GPIO_NUM;
+    config.pin_pwdn      = PWDN_GPIO_NUM;
+    config.pin_reset     = RESET_GPIO_NUM;
+    config.xclk_freq_hz  = 20000000;
+    config.frame_size    = FRAMESIZE_UXGA;
+    config.pixel_format  = PIXFORMAT_JPEG;
+    config.grab_mode     = CAMERA_GRAB_WHEN_EMPTY;
+    config.fb_location   = CAMERA_FB_IN_PSRAM;
+    config.jpeg_quality  = 12;
+    config.fb_count      = 1;
+
+    if (config.pixel_format == PIXFORMAT_JPEG)
+    {
+        if (psramFound())
+        {
+            config.jpeg_quality = 10;
+            config.fb_count     = 2;
+            config.grab_mode    = CAMERA_GRAB_LATEST;
+        }
+        else
+        {
+            config.frame_size  = FRAMESIZE_SVGA;
+            config.fb_location = CAMERA_FB_IN_DRAM;
+        }
+    }
+    else
+    {
+        config.frame_size = FRAMESIZE_240X240;
+#if CONFIG_IDF_TARGET_ESP32S3
+        config.fb_count = 2;
+#endif
+    }
+
+    esp_err_t err = esp_camera_init(&config);
+    if (err != ESP_OK)
+    {
+        Serial.printf("[CAM] Init failed: 0x%x\n", err);
+        return;
+    }
+
+    sensor_t *s = esp_camera_sensor_get();
+    if (s->id.PID == OV3660_PID)
+    {
+        s->set_vflip(s, 1);
+        s->set_brightness(s, 1);
+        s->set_saturation(s, -2);
+    }
+    if (config.pixel_format == PIXFORMAT_JPEG)
+        s->set_framesize(s, FRAMESIZE_QVGA);
+
+#if defined(CAMERA_MODEL_ESP32S3_EYE)
+    s->set_vflip(s, 1);
+#endif
+
+    Serial.println("[CAM] Camera init OK");
+}
+
+/* =========================================================================
+ * Take photo → POST /ocr → send TRANSCRIPT: to K64F
+ * ========================================================================= */
+void TakePhotoAndProcess(void)
+{
+    Serial.println("[CAM] Capturing...");
+
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb)
+    {
+        Serial.println("[CAM] ERROR: capture failed");
+        Serial1.println("TRANSCRIPT:Camera error");
+        return;
+    }
+
+    Serial.printf("[CAM] %d bytes captured\r\n", (int)fb->len);
+
+    /* Copy to heap so camera buffer is freed immediately */
+    uint8_t *jpegCopy = (uint8_t *)malloc(fb->len);
+    size_t   jpegLen  = fb->len;
+
+    if (!jpegCopy)
+    {
+        Serial.println("[CAM] ERROR: malloc failed");
+        esp_camera_fb_return(fb);
+        Serial1.println("TRANSCRIPT:Memory error");
+        return;
+    }
+
+    memcpy(jpegCopy, fb->buf, fb->len);
+    esp_camera_fb_return(fb);   /* free camera buffer ASAP */
+
+    if (WiFi.status() != WL_CONNECTED)
+    {
+        Serial.println("[CAM] WiFi not connected");
+        free(jpegCopy);
+        Serial1.println("TRANSCRIPT:WiFi error");
+        return;
+    }
+
+    HTTPClient http;
+    http.begin(FLASK_OCR_URL);
+    http.addHeader("Content-Type", "image/jpeg");
+    http.setTimeout(20000);
+
+    int code = http.POST(jpegCopy, jpegLen);
+    free(jpegCopy);
+
+    if (code == 200)
+    {
+        String body = http.getString();
+        body.trim();
+        Serial.printf("[CAM] OCR result: %s\r\n", body.c_str());
+
+        Serial1.print("TRANSCRIPT:");
+        Serial1.print(body);
+        Serial1.print("\n");
+
+        Serial.printf("[UART→K64F] TRANSCRIPT:%s\r\n", body.c_str());
+    }
+    else
+    {
+        Serial.printf("[CAM] POST /ocr failed: %d\r\n", code);
+        Serial1.println("TRANSCRIPT:OCR error");
+    }
+
+    http.end();
+}
+
+/* =========================================================================
+ * Audio helpers
+ * ========================================================================= */
+
+/* Compute checksum — same algorithm as K64F side */
+static uint16_t computeChecksum(const int16_t *data, uint16_t count)
+{
+    uint16_t sum = 0;
+    const uint8_t *bytes = (const uint8_t *)data;
+    for (uint32_t i = 0; i < (uint32_t)count * 2; i++)
+        sum += bytes[i];
+    return sum;
+}
+
+/* POST raw int16 PCM bytes to Flask /audio → get plain-text transcript */
+static void postAudioAndRespond(const int16_t *data, uint16_t count)
+{
+    if (WiFi.status() != WL_CONNECTED)
+    {
+        Serial.println("[AUDIO] WiFi not connected — skipping POST");
+        Serial1.println("TRANSCRIPT:WiFi error");
+        return;
+    }
+
+    uint32_t byteLen = (uint32_t)count * 2;
+
+    HTTPClient http;
+    http.begin(FLASK_AUDIO_URL);
+    http.addHeader("Content-Type", "application/octet-stream");
+    http.setTimeout(90000);   /* Whisper can be slow */
+
+    /* Cast to uint8_t* — Flask /audio expects raw int16 little-endian bytes */
+    int code = http.POST((uint8_t *)data, byteLen);
+
+    if (code == 200)
+    {
+        String transcript = http.getString();
+        transcript.trim();
+        Serial.printf("[AUDIO] Transcript: %s\r\n", transcript.c_str());
+
+        Serial1.print("TRANSCRIPT:");
+        Serial1.print(transcript);
+        Serial1.print("\n");
+
+        Serial.printf("[UART→K64F] TRANSCRIPT:%s\r\n", transcript.c_str());
+    }
+    else
+    {
+        Serial.printf("[AUDIO] POST /audio failed: %d\r\n", code);
+        Serial1.println("TRANSCRIPT:Audio error");
+    }
+
+    http.end();
+}
+
+/* =========================================================================
+ * Process one complete audio frame from the state machine
+ * ========================================================================= */
+static void handleAudioFrame(void)
+{
+    uint16_t calcCs = computeChecksum(rxArray, expectCount);
+    /* csByte0 and the second byte are already read by state machine caller */
+    /* checksum validation happens in READ_CHECKSUM_1 case — see loop() */
+    Serial.printf("[AUDIO] Good frame: count=%u\r\n", expectCount);
+    postAudioAndRespond(rxArray, expectCount);
+}
+
+/* =========================================================================
+ * setup()
+ * ========================================================================= */
+// void setup()
+// {
+//     Serial.begin(115200);
+//     Serial.setDebugOutput(true);
+//     delay(1000);
+
+//     Camera_Init();
+
+//     /* Large RX buffer so audio bytes are not dropped while we process */
+//     Serial1.setRxBufferSize(80000);
+//     Serial1.begin(K64F_BAUDRATE, SERIAL_8N1, K64F_RX_PIN, K64F_TX_PIN);
+//     Serial.println("[UART] K64F link ready (RX=42, TX=41)");
+
+//     Serial.print("[WiFi] Connecting");
+//     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+//     WiFi.setSleep(false);
+//     while (WiFi.status() != WL_CONNECTED)
+//     {
+//         delay(500);
+//         Serial.print(".");
+//     }
+//     Serial.println();
+//     Serial.print("[WiFi] Connected. IP: ");
+//     Serial.println(WiFi.localIP());
+
+//     Serial.println("[ESP32] Ready. Waiting for TAKE_PHOTO or audio frame...");
+// }
+
+void setup()
+{
+    Serial.begin(115200);
+    Serial.setDebugOutput(true);
+    delay(1000);
+
+    /* WiFi FIRST — before camera init touches hardware */
+    Serial.print("[WiFi] Connecting");
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect(true);
+    delay(100);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    WiFi.setSleep(false);
+
+    int retries = 0;
+    while (WiFi.status() != WL_CONNECTED && retries < 40)
+    {
+        delay(500);
+        Serial.print(".");
+        retries++;
+    }
+    Serial.println();
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        Serial.print("[WiFi] Connected. IP: ");
+        Serial.println(WiFi.localIP());
+    }
+    else
+    {
+        Serial.println("[WiFi] FAILED — check SSID/password. Continuing anyway.");
+    }
+
+    /* Camera init after WiFi is stable */
+    Camera_Init();
+
+    /* UART to K64F */
+    Serial1.setRxBufferSize(40000);
+    Serial1.begin(K64F_BAUDRATE, SERIAL_8N1, K64F_RX_PIN, K64F_TX_PIN);
+    Serial.println("[UART] K64F link ready (RX=42, TX=41)");
+
+    Serial.println("[ESP32] Ready. Waiting for TAKE_PHOTO or audio frame...");
+}
+
+/* =========================================================================
+ * loop() — handles both text commands and binary audio frames on Serial1
+ *
+ * Strategy:
+ *   The state machine runs byte-by-byte on everything coming in.
+ *   When we are in WAIT_START_0 and see a printable ASCII character,
+ *   we accumulate it into a text line buffer.
+ *   When '\n' arrives in text mode, we dispatch the command.
+ *   When 0xAA arrives, we hand off to the binary frame state machine.
+ *   This works because 0xAA is not a printable ASCII character.
+ * ========================================================================= */
+
+/* Text line accumulator for commands like "TAKE_PHOTO\n" */
+static char  lineBuf[256];
+static int   lineIdx = 0;
+
+void loop()
+{
+    while (Serial1.available())
+    {
+        uint8_t b = (uint8_t)Serial1.read();
+
+        /* ── Binary audio frame path ────────────────────────────────────── */
+        if (rxState != WAIT_START_0)
+        {
+            /* Already inside a frame — keep feeding state machine */
+            switch (rxState)
+            {
+                case WAIT_START_1:
+                    if      (b == FRAME_START_1) rxState = READ_COUNT_0;
+                    else if (b == FRAME_START_0) rxState = WAIT_START_1;
+                    else                         rxState = WAIT_START_0;
+                    break;
+
+                case READ_COUNT_0:
+                    expectCount = b;
+                    rxState = READ_COUNT_1;
+                    break;
+
+                case READ_COUNT_1:
+                    expectCount |= ((uint16_t)b << 8);
+                    if (expectCount == 0 || expectCount > MAX_SAMPLES)
+                    {
+                        Serial.printf("[AUDIO] Bad count %u — resync\r\n", expectCount);
+                        rxState = WAIT_START_0;
+                    }
+                    else
+                    {
+                        byteIndex = 0;
+                        rxState   = READ_DATA;
+                    }
+                    break;
+
+                case READ_DATA:
+                    rxBytes[byteIndex++] = b;
+                    if (byteIndex >= (uint32_t)expectCount * 2)
+                        rxState = READ_CHECKSUM_0;
+                    break;
+
+                case READ_CHECKSUM_0:
+                    csByte0 = b;
+                    rxState = READ_CHECKSUM_1;
+                    break;
+
+                case READ_CHECKSUM_1:
+                {
+                    uint16_t rxCs   = (uint16_t)csByte0 | ((uint16_t)b << 8);
+                    uint16_t calcCs = computeChecksum(rxArray, expectCount);
+
+                    if (calcCs == rxCs)
+                    {
+                        Serial.printf("[AUDIO] Checksum OK (0x%04X) count=%u\r\n",
+                                      calcCs, expectCount);
+                        postAudioAndRespond(rxArray, expectCount);
+                    }
+                    else
+                    {
+                        Serial.printf("[AUDIO] Checksum FAIL rx=0x%04X calc=0x%04X\r\n",
+                                      rxCs, calcCs);
+                    }
+
+                    rxState  = WAIT_START_0;
+                    lineIdx  = 0;   /* discard any partial text that got mixed in */
+                    break;
+                }
+
+                default:
+                    rxState = WAIT_START_0;
+                    break;
+            }
+            continue;   /* next byte */
+        }
+
+        /* ── WAIT_START_0 — could be text or start of audio frame ───────── */
+        if (b == FRAME_START_0)
+        {
+            /* Possible audio frame — switch to binary mode */
+            rxState = WAIT_START_1;
+            lineIdx = 0;   /* discard any partial text line */
+            continue;
+        }
+
+        /* It is a text byte — accumulate into line buffer */
+        if (b == '\r') continue;   /* ignore CR */
+
+        if (b == '\n')
+        {
+            lineBuf[lineIdx] = '\0';
+
+            if (lineIdx > 0)
+            {
+                Serial.printf("[UART←K64F] '%s'\r\n", lineBuf);
+
+                if (strcmp(lineBuf, "TAKE_PHOTO") == 0)
+                {
+                    TakePhotoAndProcess();
+                }
+                else if (strncmp(lineBuf, "STABILITY:", 10) == 0)
+                {
+                    /* Stability payloads are handled by K64F→Flask directly
+                       in the current architecture, but log it here just in case */
+                    Serial.printf("[STAB] %s\r\n", lineBuf + 10);
+                }
+                else
+                {
+                    Serial.printf("[UART] Unknown cmd: '%s'\r\n", lineBuf);
+                }
+            }
+
+            lineIdx = 0;
+            continue;
+        }
+
+        /* Normal printable character — add to line buffer */
+        if (lineIdx < (int)(sizeof(lineBuf) - 1))
+            lineBuf[lineIdx++] = (char)b;
+    }
+}
