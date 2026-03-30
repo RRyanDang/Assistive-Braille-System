@@ -1,3 +1,6 @@
+/* ════════════════════════════════════════════════════════════════════════════
+   SECTION 0 — LIBRARIES
+   ════════════════════════════════════════════════════════════════════════════ */
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -97,10 +100,10 @@
 #define DISTANCE_MIN_CM     7
 #define DISTANCE_MAX_CM     30
 
-/* ── Braille LEDs — LED1 moved to PTB20 to free PTD0 for buzzer ─────────── */
+/* Braille LEDs */
 #define LED1_GPIO  GPIOB
 #define LED1_PORT  PORTB
-#define LED1_PIN   20U   /* was PTD0 — moved to PTB20 */
+#define LED1_PIN   20U  
 
 #define LED2_GPIO  GPIOC
 #define LED2_PORT  PORTC
@@ -122,10 +125,10 @@
 #define LED6_PORT  PORTA
 #define LED6_PIN   2U
 
-#define BRAILLE_CHAR_DELAY_MS  800U
+#define BRAILLE_CHAR_DELAY_MS  800U 
 
 #define DECIMATION_FACTOR   2U
-#define MAX_SAMPLES         19000U
+#define MAX_SAMPLES         19000U /* how much data in 1 second*/
 
 #define TASK_STACK_SIZE     512U
 #define TASK_PRIORITY       (tskIDLE_PRIORITY + 2U)
@@ -133,13 +136,13 @@
 /* ════════════════════════════════════════════════════════════════════════════
    SECTION 2 — SAMPLE BUFFER
    ════════════════════════════════════════════════════════════════════════════ */
-
+// this is for audio
 static int16_t sampleBuffer[MAX_SAMPLES];
 
 /* ════════════════════════════════════════════════════════════════════════════
    SECTION 3 — ADC
    ════════════════════════════════════════════════════════════════════════════ */
-
+// standard set up for ADC usage
 static void ADC_Init(void)
 {
     adc16_config_t adcConfig;
@@ -150,6 +153,7 @@ static void ADC_Init(void)
     ADC16_EnableHardwareTrigger(LDR_ADC_BASE, false);
 }
 
+// reading data from ADC
 static uint16_t ADC_ReadChannel(uint32_t channel)
 {
     adc16_channel_config_t ch;
@@ -169,6 +173,8 @@ static inline uint16_t ADC_ReadMic(void) { return ADC_ReadChannel(MIC_ADC_CHANNE
    SECTION 4 — LEDs + TRIGGER
    ════════════════════════════════════════════════════════════════════════════ */
 
+// standard set up to use LED
+// it is written by developers, and simply refactored by Claude
 static void LED_Init(void)
 {
     gpio_pin_config_t ledConfig = { kGPIO_DigitalOutput, 1U };
@@ -179,11 +185,13 @@ static void LED_Init(void)
     GPIO_PinInit(LED_GREEN_GPIO, LED_GREEN_PIN, &ledConfig);
 }
 
+// it is written by developers, and simply refactored by Claude
 static void LED_Red_ON(void)    { GPIO_PinWrite(LED_RED_GPIO,   LED_RED_PIN,   0U); }
 static void LED_Red_OFF(void)   { GPIO_PinWrite(LED_RED_GPIO,   LED_RED_PIN,   1U); }
 static void LED_Green_ON(void)  { GPIO_PinWrite(LED_GREEN_GPIO, LED_GREEN_PIN, 0U); }
 static void LED_Green_OFF(void) { GPIO_PinWrite(LED_GREEN_GPIO, LED_GREEN_PIN, 1U); }
 
+// it is written by developers, and simply refactored by Claude
 static void Trigger_Init(void)
 {
     gpio_pin_config_t trigConfig = { kGPIO_DigitalOutput, 0U };
@@ -195,9 +203,9 @@ static void Trigger_Allow(void) { GPIO_PinWrite(TRIGGER_GPIO, TRIGGER_PIN, 1U); 
 static void Trigger_Block(void) { GPIO_PinWrite(TRIGGER_GPIO, TRIGGER_PIN, 0U); }
 
 /* ════════════════════════════════════════════════════════════════════════════
-   SECTION 5 — BUZZER (PTD0 → 1kΩ → NPN Base → Collector to Buzzer-)
+   SECTION 5 — BUZZER (PTD0 → 1kΩ → NPN Base → Collector to Buzzer)
    ════════════════════════════════════════════════════════════════════════════ */
-
+// it is written by developers, and simply refactored by Claude
 static void Buzzer_Init(void)
 {
     CLOCK_EnableClock(kCLOCK_PortD);
@@ -207,9 +215,11 @@ static void Buzzer_Init(void)
     PRINTF("Buzzer Init Done (PTD0)\r\n");
 }
 
+// it is written by developers, and simply refactored by Claude
 static void Buzzer_ON(void)  { GPIO_PinWrite(BUZZER_GPIO, BUZZER_PIN, 1U); }
 static void Buzzer_OFF(void) { GPIO_PinWrite(BUZZER_GPIO, BUZZER_PIN, 0U); }
 
+// it is written by developers, and simply refactored by Claude
 static void Buzzer_Beep(uint32_t durationMs)
 {
     Buzzer_ON();
@@ -220,7 +230,7 @@ static void Buzzer_Beep(uint32_t durationMs)
 /* ════════════════════════════════════════════════════════════════════════════
    SECTION 6 — BUTTON (PTB23)
    ════════════════════════════════════════════════════════════════════════════ */
-
+// simply set up to use a button
 static void Button_Init(void)
 {
     CLOCK_EnableClock(BTN_CLOCK);
@@ -233,11 +243,13 @@ static void Button_Init(void)
     GPIO_PinInit(BTN_GPIO, BTN_PIN, &gpioCfg);
 }
 
+// checking if button is pressed
 static inline bool Button_IsPressed(void)
 {
     return GPIO_PinRead(BTN_GPIO, BTN_PIN) == 0U;
 }
 
+// Line 253 - 270 is written by developers, but double-confirmed by Claude
 static uint8_t CountPresses(void)
 {
     uint8_t    count     = 1;
@@ -262,6 +274,8 @@ static uint8_t CountPresses(void)
    SECTION 7 — UART3
    ════════════════════════════════════════════════════════════════════════════ */
 
+// code is inspired from Lab 5 
+// original code from developers
 static void UART3_Init(void)
 {
     uart_config_t config;
@@ -275,11 +289,17 @@ static void UART3_Init(void)
     UART_Init(ESP_UART_BASE, &config, CLOCK_GetFreq(kCLOCK_BusClk));
 }
 
+
+// code is inspired from Lab 5 
+// original code from developers
 static void UART3_SendString(const char *msg)
 {
     UART_WriteBlocking(ESP_UART_BASE, (const uint8_t *)msg, strlen(msg));
 }
 
+
+// code is inspired from Lab 5 
+// original code from developers
 static void SendCameraCommand(void)
 {
     UART3_SendString(CAMERA_CMD);
@@ -296,6 +316,7 @@ static void SendCameraCommand(void)
  *
  * Called at the end of every RunSensorGate() — both PASS and BLOCKED.
  */
+// line 320 - 333 is written by Claude and validated by developers
 static void SendStabilityData(uint8_t lightOk, uint8_t stableOk,
                                uint8_t distOk,  uint16_t dist_cm)
 {
@@ -311,6 +332,7 @@ static void SendStabilityData(uint8_t lightOk, uint8_t stableOk,
     PRINTF("[TX] Stability: %s", msg);
 }
 
+// initial calculation is written by developers, and Claude is used to fix minor issue regarding syntax and data type
 static uint16_t ComputeChecksum(const int16_t *data, uint16_t count)
 {
     uint16_t sum = 0;
@@ -320,6 +342,7 @@ static uint16_t ComputeChecksum(const int16_t *data, uint16_t count)
     return sum;
 }
 
+// 346 - 357 is written with Claude
 static void SendAudioFrame(const int16_t *data, uint16_t count)
 {
     uint8_t  header[4];
@@ -353,8 +376,8 @@ static int UartDataReady(void)
    SECTION 8 — I2C BUS
    ════════════════════════════════════════════════════════════════════════════ */
 
-static void i2c_hw_init(void)
-{
+// set up is done by developers, inspired from Lab 5
+static void i2c_hw_init(void) {
     CLOCK_EnableClock(kCLOCK_I2c0);
     CLOCK_EnableClock(kCLOCK_PortE);
     port_pin_config_t config = {
@@ -370,8 +393,8 @@ static void i2c_hw_init(void)
     I2C_MasterInit(I2C0, &masterConfig, CLOCK_GetFreq(kCLOCK_BusClk));
 }
 
-static void i2c_reinit(void)
-{
+// Line 397 - 404 is written by Claude
+static void i2c_reinit(void) {
     I2C_MasterDeinit(I2C0);
     vTaskDelay(pdMS_TO_TICKS(50));
     i2c_master_config_t masterConfig;
@@ -385,6 +408,9 @@ static void i2c_reinit(void)
    SECTION 9 — I2C HELPERS
    ════════════════════════════════════════════════════════════════════════════ */
 
+// this section 9 functions is reseached and initial versions were written
+// Claude double-confirms and make change to syntax and data type 
+// verified by developers
 static void i2c_write_byte(uint8_t slave_addr, uint8_t data)
 {
     i2c_master_transfer_t xfer;
@@ -436,6 +462,8 @@ static void i2c_read_registers(uint8_t slave_addr, uint8_t start_reg,
    SECTION 10 — VL53L0X HELPERS
    ════════════════════════════════════════════════════════════════════════════ */
 
+// this section 10 is written by Clause
+// carefully selected and debugged by developers
 static void vl53_write8(uint8_t reg, uint8_t val)
 {
     uint8_t buf[2] = { reg, val };
@@ -461,6 +489,7 @@ static uint8_t vl53_read8(uint8_t reg)
     return val;
 }
 
+
 static bool vl53_read_bytes(uint8_t reg, uint8_t *out, uint8_t len)
 {
     i2c_master_transfer_t xfer;
@@ -479,6 +508,8 @@ static bool vl53_read_bytes(uint8_t reg, uint8_t *out, uint8_t len)
    SECTION 11 — ADXL345
    ════════════════════════════════════════════════════════════════════════════ */
 
+// researched and put together by developers. 
+// checked by Claude for its correctness
 static void adxl345_init(void)
 {
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -494,6 +525,8 @@ static void adxl345_init(void)
     PRINTF("ADXL345 Init Done\r\n");
 }
 
+// Line 520 - 538 is written by Claude
+// Debugged by developers as it was kind of wrong
 static void adxl345_read_accel(int16_t *x, int16_t *y, int16_t *z)
 {
     uint8_t raw[ACCEL_DATA_LEN];
@@ -518,6 +551,8 @@ static uint8_t is_moving(int16_t xn, int16_t yn, int16_t zn,
    SECTION 12 — LCD
    ════════════════════════════════════════════════════════════════════════════ */
 
+// researched and put together by developers. 
+// checked by Claude for its correctness
 static void lcd_pulse_enable(uint8_t data)
 {
     i2c_write_byte(LCD_ADDR, data | LCD_EN);
@@ -526,12 +561,16 @@ static void lcd_pulse_enable(uint8_t data)
     vTaskDelay(pdMS_TO_TICKS(1));
 }
 
+// researched and put together by developers. 
+// checked by Claude for its correctness
 static void lcd_write4bits(uint8_t nibble)
 {
     i2c_write_byte(LCD_ADDR, nibble | LCD_BACKLIGHT);
     lcd_pulse_enable(nibble | LCD_BACKLIGHT);
 }
 
+// researched and put together by developers. 
+// checked by Claude for its correctness
 static void lcd_send(uint8_t value, uint8_t rs)
 {
     uint8_t high = (value & 0xF0) | rs | LCD_BACKLIGHT;
@@ -540,22 +579,29 @@ static void lcd_send(uint8_t value, uint8_t rs)
     lcd_write4bits(low);
 }
 
+// Line 567 - 569 is wriiten by Claude
 static void lcd_command(uint8_t cmd) { lcd_send(cmd, 0); vTaskDelay(pdMS_TO_TICKS(2)); }
 static void lcd_char(uint8_t ch)     { lcd_send(ch, LCD_RS); }
 static void lcd_print(const char *s) { while (*s) lcd_char((uint8_t)*s++); }
 
+// researched and put together by developers. 
+// checked by Claude for its correctness
 static void lcd_set_cursor(uint8_t row, uint8_t col)
 {
     const uint8_t row_offsets[] = {0x00, 0x40};
     lcd_command(LCD_SET_DDRAM | (row_offsets[row] + col));
 }
 
+// researched and put together by developers. 
+// checked by Claude for its correctness
 static void lcd_clear_display(void)
 {
     lcd_command(LCD_CLEAR);
     vTaskDelay(pdMS_TO_TICKS(5));
 }
-
+   
+// researched and put together by developers. 
+// checked by Claude for its correctness
 static void lcd_print_row(uint8_t row, const char *str)
 {
     char padded[17];
@@ -564,6 +610,8 @@ static void lcd_print_row(uint8_t row, const char *str)
     lcd_print(padded);
 }
 
+// researched and put together by developers. 
+// checked by Claude for its correctness
 static void lcd_init(void)
 {
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -587,6 +635,9 @@ static void lcd_init(void)
    SECTION 13 — VL53L0X
    ════════════════════════════════════════════════════════════════════════════ */
 
+/**
+both vl53l0x_init and vl53l0x_read_mm is wriiten by Claude
+*/
 static bool vl53l0x_init(void)
 {
     uint8_t id = vl53_read8(0xC0);
@@ -656,6 +707,7 @@ static uint16_t vl53l0x_read_mm(void)
 
 typedef struct { char letter; uint8_t pattern; } BrailleChar;
 
+// this is researched and put together by developers
 static const BrailleChar braille_table[] = {
     { 'a', 0b000001 }, { 'b', 0b000011 }, { 'c', 0b001001 },
     { 'd', 0b011001 }, { 'e', 0b010001 }, { 'f', 0b001011 },
@@ -672,6 +724,9 @@ static const BrailleChar braille_table[] = {
 };
 #define BRAILLE_TABLE_SIZE (sizeof(braille_table) / sizeof(braille_table[0]))
 
+/**
+line 701 - 750 is developed by developers, and only refactored nicely by Claude
+*/
 static void braille_pins_init(void)
 {
     CLOCK_EnableClock(kCLOCK_PortB);  /* LED1 on PTB20 — PortB already on */
@@ -725,9 +780,9 @@ static void braille_display_string(const char *str)
 
 /* ════════════════════════════════════════════════════════════════════════════
    SECTION 15 — WAIT FOR TRANSCRIPT
-   Milestone 5: checks for "BUZZER" → fires buzzer instead of Braille scroll
+   Checks for "BUZZER" → fires buzzer instead of Braille scroll
    ════════════════════════════════════════════════════════════════════════════ */
-
+// this function is assisted with Claude, verifying if-statements and syntax
 static int WaitForTranscript(void)
 {
     char     buf[TRANSCRIPT_BUF_SIZE];
@@ -798,7 +853,7 @@ static int WaitForTranscript(void)
 /* ════════════════════════════════════════════════════════════════════════════
    SECTION 16 — SENSOR GATE
    ════════════════════════════════════════════════════════════════════════════ */
-
+// 825 - 869 is written with Claude and verified by developers using debug printf
 static bool RunSensorGate(int16_t *x_prev, int16_t *y_prev, int16_t *z_prev,
                            uint32_t *stableMs, uint8_t *stableOk)
 {
@@ -849,7 +904,7 @@ static bool RunSensorGate(int16_t *x_prev, int16_t *y_prev, int16_t *z_prev,
 /* ════════════════════════════════════════════════════════════════════════════
    SECTION 17 — MAIN FREERTOS TASK
    ════════════════════════════════════════════════════════════════════════════ */
-
+// this MainTask(void *pvParameters) func is written with the help of Claude. 
 static void MainTask(void *pvParameters)
 {
     (void)pvParameters;
@@ -1035,6 +1090,7 @@ static void MainTask(void *pvParameters)
    SECTION 18 — main()
    ════════════════════════════════════════════════════════════════════════════ */
 
+// written by developers
 int main(void)
 {
     BOARD_InitBootPins();
